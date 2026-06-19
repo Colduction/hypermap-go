@@ -9,10 +9,18 @@ import (
 
 const queryEscapeHex = "0123456789ABCDEF"
 
+// orderedMap stores its entries in a slice whose first element (index 0) is a
+// permanent sentinel. The sentinel anchors a circular doubly-linked list, so
+// entries[0].next is the head, entries[0].prev is the tail, and an empty list
+// is the sentinel pointing at itself. Anchoring the list this way removes the
+// need for separate head/tail fields and lets link/unlink run without
+// boundary checks. Deleted slots are recycled through a singly-linked free
+// chain rooted at free, so steady-state insert/delete reuses storage instead
+// of growing it.
 type orderedMap[T comparable, T2 any] struct {
-	index            map[T]int
-	entries          []entries[T, T2]
-	head, tail, free int
+	index   map[T]int
+	entries []entries[T, T2]
+	free    int
 }
 
 type entries[T comparable, T2 any] struct {
@@ -32,14 +40,15 @@ type entries[T comparable, T2 any] struct {
 // expected.
 type Map[T comparable, T2 any] orderedMap[T, T2]
 
-// New returns an initialized [Map] with storage reserved for capacity entries.
+// New returns an initialized [Map] with storage reserved for up to capacity
+// live entries.
 func New[T comparable, T2 any](capacity int) Map[T, T2] {
 	var m Map[T, T2]
 	m.Init(capacity)
 	return m
 }
 
-// Init prepares m with storage reserved for capacity entries.
+// Init prepares m with storage reserved for up to capacity live entries.
 func (m *Map[T, T2]) Init(capacity int) {
 	if capacity < 0 {
 		panic("hypermap: negative ordered map capacity")
@@ -50,7 +59,7 @@ func (m *Map[T, T2]) Init(capacity int) {
 		return
 	}
 	m.index = make(map[T]int, capacity)
-	m.entries = make([]entries[T, T2], 0, capacity)
+	m.entries = make([]entries[T, T2], 1, capacity+1)
 }
 
 // Len reports the number of entries in m.
@@ -58,19 +67,23 @@ func (m *Map[T, T2]) Len() int {
 	return len(m.index)
 }
 
-// Cap reports the number of entries m can store before growing its slot slice.
+// Cap reports the maximum live entries m can hold before growing its slot slice.
 func (m *Map[T, T2]) Cap() int {
-	return cap(m.entries)
+	c := cap(m.entries)
+	if c == 0 {
+		return 0
+	}
+	return c - 1
 }
 
-// Get returns the value for key.
+// Get returns the value for key and reports whether key is present.
 func (m *Map[T, T2]) Get(key T) (T2, bool) {
 	ref := m.index[key]
 	if ref == 0 {
 		var zero T2
 		return zero, false
 	}
-	return m.entries[ref-1].value, true
+	return m.entries[ref].value, true
 }
 
 // Has reports whether key is present in m.
@@ -81,13 +94,16 @@ func (m *Map[T, T2]) Has(key T) bool {
 // Set stores value for key and returns the replaced value when key is present.
 func (m *Map[T, T2]) Set(key T, value T2) (T2, bool) {
 	if ref := m.index[key]; ref != 0 {
-		entry := &m.entries[ref-1]
+		entry := &m.entries[ref]
 		old := entry.value
 		entry.value = value
 		return old, true
 	}
 	if m.index == nil {
 		m.index = make(map[T]int, 1)
+	}
+	if len(m.entries) == 0 {
+		m.entries = append(m.entries, entries[T, T2]{}) // sentinel
 	}
 	ref := m.addSlot(key, value)
 	m.index[key] = ref
@@ -103,19 +119,18 @@ func (m *Map[T, T2]) Delete(key T) (T2, bool) {
 		var zero T2
 		return zero, false
 	}
-	entry := &m.entries[ref-1]
-	old := entry.value
-	m.deleteRef(ref, entry, key)
+	old := m.entries[ref].value
+	m.deleteRef(ref, &m.entries[ref], key)
 	return old, true
 }
 
 // Clear removes all entries while keeping allocated storage for reuse.
 func (m *Map[T, T2]) Clear() {
 	clear(m.index)
-	clear(m.entries)
-	m.entries = m.entries[:0]
-	m.head = 0
-	m.tail = 0
+	if len(m.entries) != 0 {
+		clear(m.entries)
+		m.entries = m.entries[:1] // keep the zeroed sentinel
+	}
 	m.free = 0
 }
 
@@ -125,31 +140,44 @@ func (m *Map[T, T2]) Reset() {
 	*m = zero
 }
 
-// Front returns the first key and value in insertion order.
+// Front returns the first key and value in insertion order and reports whether
+// m is non-empty.
 func (m *Map[T, T2]) Front() (T, T2, bool) {
-	ref := m.head
+	if len(m.entries) == 0 {
+		var zeroKey T
+		var zeroValue T2
+		return zeroKey, zeroValue, false
+	}
+	ref := m.entries[0].next
 	if ref == 0 {
 		var zeroKey T
 		var zeroValue T2
 		return zeroKey, zeroValue, false
 	}
-	entry := &m.entries[ref-1]
+	entry := &m.entries[ref]
 	return entry.key, entry.value, true
 }
 
-// Back returns the last key and value in insertion order.
+// Back returns the last key and value in insertion order and reports whether m
+// is non-empty.
 func (m *Map[T, T2]) Back() (T, T2, bool) {
-	ref := m.tail
+	if len(m.entries) == 0 {
+		var zeroKey T
+		var zeroValue T2
+		return zeroKey, zeroValue, false
+	}
+	ref := m.entries[0].prev
 	if ref == 0 {
 		var zeroKey T
 		var zeroValue T2
 		return zeroKey, zeroValue, false
 	}
-	entry := &m.entries[ref-1]
+	entry := &m.entries[ref]
 	return entry.key, entry.value, true
 }
 
-// Next returns the key and value after key in insertion order.
+// Next returns the key and value after key in insertion order and reports
+// whether key has a successor.
 func (m *Map[T, T2]) Next(key T) (T, T2, bool) {
 	ref := m.index[key]
 	if ref == 0 {
@@ -157,17 +185,18 @@ func (m *Map[T, T2]) Next(key T) (T, T2, bool) {
 		var zeroValue T2
 		return zeroKey, zeroValue, false
 	}
-	next := m.entries[ref-1].next
+	next := m.entries[ref].next
 	if next == 0 {
 		var zeroKey T
 		var zeroValue T2
 		return zeroKey, zeroValue, false
 	}
-	entry := &m.entries[next-1]
+	entry := &m.entries[next]
 	return entry.key, entry.value, true
 }
 
-// Prev returns the key and value before key in insertion order.
+// Prev returns the key and value before key in insertion order and reports
+// whether key has a predecessor.
 func (m *Map[T, T2]) Prev(key T) (T, T2, bool) {
 	ref := m.index[key]
 	if ref == 0 {
@@ -175,13 +204,13 @@ func (m *Map[T, T2]) Prev(key T) (T, T2, bool) {
 		var zeroValue T2
 		return zeroKey, zeroValue, false
 	}
-	prev := m.entries[ref-1].prev
+	prev := m.entries[ref].prev
 	if prev == 0 {
 		var zeroKey T
 		var zeroValue T2
 		return zeroKey, zeroValue, false
 	}
-	entry := &m.entries[prev-1]
+	entry := &m.entries[prev]
 	return entry.key, entry.value, true
 }
 
@@ -191,15 +220,19 @@ func (m *Map[T, T2]) MoveToFront(key T) bool {
 	if ref == 0 {
 		return false
 	}
-	if ref == m.head {
+	e := m.entries
+	head := e[0].next
+	if head == ref {
 		return true
 	}
-	entry := &m.entries[ref-1]
-	m.unlink(entry)
+	entry := &e[ref]
+	prev, next := entry.prev, entry.next
+	e[prev].next = next
+	e[next].prev = prev
 	entry.prev = 0
-	entry.next = m.head
-	m.entries[m.head-1].prev = ref
-	m.head = ref
+	entry.next = head
+	e[head].prev = ref
+	e[0].next = ref
 	return true
 }
 
@@ -209,54 +242,79 @@ func (m *Map[T, T2]) MoveToBack(key T) bool {
 	if ref == 0 {
 		return false
 	}
-	if ref == m.tail {
+	e := m.entries
+	tail := e[0].prev
+	if tail == ref {
 		return true
 	}
-	entry := &m.entries[ref-1]
-	m.unlink(entry)
-	entry.prev = m.tail
+	entry := &e[ref]
+	prev, next := entry.prev, entry.next
+	e[prev].next = next
+	e[next].prev = prev
 	entry.next = 0
-	m.entries[m.tail-1].next = ref
-	m.tail = ref
+	entry.prev = tail
+	e[tail].next = ref
+	e[0].prev = ref
 	return true
 }
 
-// PopFront removes and returns the first key and value in insertion order.
+// PopFront removes and returns the first key and value in insertion order and
+// reports whether an entry is removed.
 func (m *Map[T, T2]) PopFront() (T, T2, bool) {
-	ref := m.head
+	if len(m.entries) == 0 {
+		var zeroKey T
+		var zeroValue T2
+		return zeroKey, zeroValue, false
+	}
+	ref := m.entries[0].next
 	if ref == 0 {
 		var zeroKey T
 		var zeroValue T2
 		return zeroKey, zeroValue, false
 	}
-	entry := &m.entries[ref-1]
+	entry := &m.entries[ref]
 	key := entry.key
 	value := entry.value
 	m.deleteRef(ref, entry, key)
 	return key, value, true
 }
 
-// PopBack removes and returns the last key and value in insertion order.
+// PopBack removes and returns the last key and value in insertion order and
+// reports whether an entry is removed.
 func (m *Map[T, T2]) PopBack() (T, T2, bool) {
-	ref := m.tail
-	if ref == 0 {
-		var zeroKey T
-		var zeroValue T2
+	if len(m.entries) == 0 {
+		var (
+			zeroKey   T
+			zeroValue T2
+		)
 		return zeroKey, zeroValue, false
 	}
-	entry := &m.entries[ref-1]
-	key := entry.key
-	value := entry.value
+	ref := m.entries[0].prev
+	if ref == 0 {
+		var (
+			zeroKey   T
+			zeroValue T2
+		)
+		return zeroKey, zeroValue, false
+	}
+	var (
+		entry = &m.entries[ref]
+		key   = entry.key
+		value = entry.value
+	)
 	m.deleteRef(ref, entry, key)
 	return key, value, true
 }
 
 // Range returns an [iter.Seq2] over each key and value in insertion order.
-// Range does not define iteration order after yield mutates m.
+// Range leaves remaining iteration behavior unspecified when yield mutates m.
 func (m *Map[T, T2]) Range() iter.Seq2[T, T2] {
 	return func(yield func(T, T2) bool) {
-		for ref := m.head; ref != 0; {
-			entry := &m.entries[ref-1]
+		if len(m.entries) == 0 {
+			return
+		}
+		for ref := m.entries[0].next; ref != 0; {
+			entry := &m.entries[ref]
 			next := entry.next
 			if !yield(entry.key, entry.value) {
 				return
@@ -266,23 +324,37 @@ func (m *Map[T, T2]) Range() iter.Seq2[T, T2] {
 	}
 }
 
-// Encode encodes m as URL query parameters using [Map]'s current key order.
-// Values for each key are encoded in slice order. A nil or empty m encodes
-// to an empty string.
-func Encode[T ~string, T2 ~[]string](m *Map[T, T2]) string {
-	if m == nil || m.Len() == 0 {
+// QueryMap is a [Map] specialized for URL query parameters. It maps string keys
+// to repeated string values and adds [QueryMap.Encode]. Every [Map] method is
+// promoted for ordered string keys and []string values.
+type QueryMap struct {
+	Map[string, []string]
+}
+
+// NewQueryMap returns an initialized [QueryMap] with storage reserved for up to
+// capacity live entries.
+func NewQueryMap(capacity int) QueryMap {
+	return QueryMap{New[string, []string](capacity)}
+}
+
+// Encode returns qm encoded as URL query parameters in key insertion order.
+// Values for each key are encoded in slice order. A nil or empty [QueryMap]
+// encodes to an empty string.
+func (qm *QueryMap) Encode() string {
+	if qm == nil || qm.Len() == 0 {
 		return ""
 	}
+	e := qm.entries
 	size := 0
-	for ref := m.head; ref != 0; {
-		entry := &m.entries[ref-1]
+	for ref := e[0].next; ref != 0; {
+		entry := &e[ref]
 		next := entry.next
 		values := entry.value
 		if len(values) == 0 {
 			ref = next
 			continue
 		}
-		keySize := queryEscapedLen(string(entry.key))
+		keySize := queryEscapedLen(entry.key)
 		for _, value := range values {
 			if size > 0 {
 				size++
@@ -296,8 +368,8 @@ func Encode[T ~string, T2 ~[]string](m *Map[T, T2]) string {
 	}
 	var sb strings.Builder
 	sb.Grow(size)
-	for ref := m.head; ref != 0; {
-		entry := &m.entries[ref-1]
+	for ref := e[0].next; ref != 0; {
+		entry := &e[ref]
 		next := entry.next
 		if len(entry.value) == 0 {
 			ref = next
@@ -307,7 +379,7 @@ func Encode[T ~string, T2 ~[]string](m *Map[T, T2]) string {
 			if sb.Len() > 0 {
 				sb.WriteByte('&')
 			}
-			appendQueryEscaped(&sb, string(entry.key))
+			appendQueryEscaped(&sb, entry.key)
 			sb.WriteByte('=')
 			appendQueryEscaped(&sb, value)
 		}
@@ -316,11 +388,22 @@ func Encode[T ~string, T2 ~[]string](m *Map[T, T2]) string {
 	return sb.String()
 }
 
+// queryEscape[c] reports whether byte c must be percent-escaped in a query
+// component. Precomputing it turns the per-byte classification in the encode
+// hot loops into a single branch-free load. Indexing a [256]bool with a byte
+// needs no bounds check.
+var queryEscape = func() (t [256]bool) {
+	for c := range len(t) {
+		t[c] = shouldEscapeQuery(byte(c))
+	}
+	return t
+}()
+
 func queryEscapedLen(s string) int {
 	n := len(s)
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		if c != ' ' && shouldEscapeQuery(c) {
+		if c != ' ' && queryEscape[c] {
 			n += 2
 		}
 	}
@@ -331,7 +414,7 @@ func appendQueryEscaped(sb *strings.Builder, s string) {
 	var start int
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		if !shouldEscapeQuery(c) {
+		if !queryEscape[c] {
 			continue
 		}
 		if start < i {
@@ -367,10 +450,13 @@ func shouldEscapeQuery(c byte) bool {
 	return true
 }
 
+// addSlot reserves a slot for key/value and returns its slice index, reusing a
+// freed slot when one is available. The caller links the returned slot into the
+// list.
 func (m *Map[T, T2]) addSlot(key T, value T2) int {
 	if m.free != 0 {
 		ref := m.free
-		entry := &m.entries[ref-1]
+		entry := &m.entries[ref]
 		m.free = entry.next
 		entry.key = key
 		entry.value = value
@@ -378,43 +464,30 @@ func (m *Map[T, T2]) addSlot(key T, value T2) int {
 		entry.next = 0
 		return ref
 	}
-	m.entries = append(m.entries, entries[T, T2]{
-		key:   key,
-		value: value,
-	})
-	return len(m.entries)
+	m.entries = append(m.entries, entries[T, T2]{key: key, value: value})
+	return len(m.entries) - 1
 }
 
+// linkBack appends ref to the tail of the circular list.
 func (m *Map[T, T2]) linkBack(ref int) {
-	tail := m.tail
-	if tail == 0 {
-		m.head = ref
-		m.tail = ref
-		return
-	}
-	entry := &m.entries[ref-1]
+	tail := m.entries[0].prev
+	entry := &m.entries[ref]
 	entry.prev = tail
-	m.entries[tail-1].next = ref
-	m.tail = ref
+	entry.next = 0
+	m.entries[tail].next = ref
+	m.entries[0].prev = ref
 }
 
+// unlink removes entry from the list. The circular sentinel makes both the
+// head and tail cases fall through to the same two writes, so no branching is
+// needed.
 func (m *Map[T, T2]) unlink(entry *entries[T, T2]) {
-	var (
-		prev = entry.prev
-		next = entry.next
-	)
-	if prev == 0 {
-		m.head = next
-	} else {
-		m.entries[prev-1].next = next
-	}
-	if next == 0 {
-		m.tail = prev
-	} else {
-		m.entries[next-1].prev = prev
-	}
+	m.entries[entry.prev].next = entry.next
+	m.entries[entry.next].prev = entry.prev
 }
 
+// deleteRef removes entry (the slot at ref) from the list and pushes its slot
+// onto the free chain for reuse by a later insert.
 func (m *Map[T, T2]) deleteRef(ref int, entry *entries[T, T2], key T) {
 	delete(m.index, key)
 	m.unlink(entry)

@@ -43,6 +43,25 @@ func main() {
 }
 ```
 
+## URL query encoding
+
+`hypermap.QueryMap` is a `Map[string, []string]` with an `Encode` method that
+renders the entries as a URL query string in the current key order. It embeds
+`Map`, so every map method (`Set`, `Get`, `MoveToFront`, `Range`, …) is
+available on it as well.
+
+```go
+m := hypermap.NewQueryMap(3)
+
+m.Set("name", []string{"ada lovelace"})
+m.Set("tags", []string{"math", "code"})
+
+fmt.Println(m.Encode()) // name=ada+lovelace&tags=math&tags=code
+```
+
+`Encode` allocates once: a `nil` or empty map returns `""`, and keys with no
+values are skipped.
+
 ## Features
 
 | Capability          | Behavior                                                                  |
@@ -52,6 +71,7 @@ func main() {
 | Lookup and mutation | O(1) average for lookup, insert, delete, movement, and front/back access. |
 | Iteration           | Supports `for key, value := range m.Range()` with `iter.Seq2`.            |
 | Storage reuse       | `Clear` keeps allocated storage, while `Reset` releases it.               |
+| Query encoding      | `QueryMap.Encode` renders `string`/`[]string` entries as a query string.  |
 
 > [!IMPORTANT]
 > `Map` does not synchronize access. Share a map across goroutines only with external synchronization, or shard independent maps by key or worker for write-heavy services.

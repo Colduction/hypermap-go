@@ -47,7 +47,7 @@ func TestMapSetGetAndOrder(t *testing.T) {
 }
 
 func TestMapEncode(t *testing.T) {
-	m := New[string, []string](4)
+	m := NewQueryMap(4)
 	m.Set("b key", []string{"two words", "x+y"})
 	m.Set("a", []string{"1"})
 	m.Set("empty", nil)
@@ -55,40 +55,40 @@ func TestMapEncode(t *testing.T) {
 	m.MoveToFront("sym")
 
 	const want = "sym=a%26b%3Dc&b+key=two+words&b+key=x%2By&a=1"
-	if got := Encode(&m); got != want {
+	if got := m.Encode(); got != want {
 		t.Fatalf("Encode = %q, want %q", got, want)
 	}
 }
 
 func TestMapEncodeEmpty(t *testing.T) {
-	if got := Encode[string, []string](nil); got != "" {
+	if got := (*QueryMap)(nil).Encode(); got != "" {
 		t.Fatalf("Encode on nil map = %q, want empty string", got)
 	}
 
-	var m Map[string, []string]
-	if got := Encode(&m); got != "" {
+	var m QueryMap
+	if got := m.Encode(); got != "" {
 		t.Fatalf("Encode on empty map = %q, want empty string", got)
 	}
 
 	m.Set("empty", []string{})
-	if got := Encode(&m); got != "" {
+	if got := m.Encode(); got != "" {
 		t.Fatalf("Encode with empty value slice = %q, want empty string", got)
 	}
 
 	m.Set("blank", []string{""})
-	if got := Encode(&m); got != "blank=" {
+	if got := m.Encode(); got != "blank=" {
 		t.Fatalf("Encode with blank value = %q, want blank=", got)
 	}
 }
 
 func TestMapEncodeMatchesQueryEscape(t *testing.T) {
-	for i := 0; i < 256; i++ {
+	for i := range 256 {
 		s := string([]byte{byte(i)})
-		m := New[string, []string](1)
+		m := NewQueryMap(1)
 		m.Set(s, []string{s})
 
 		want := url.QueryEscape(s) + "=" + url.QueryEscape(s)
-		if got := Encode(&m); got != want {
+		if got := m.Encode(); got != want {
 			t.Fatalf("Encode byte %d = %q, want %q", i, got, want)
 		}
 	}
@@ -178,7 +178,7 @@ func BenchmarkMapRange(b *testing.B) {
 }
 
 func BenchmarkMapEncode(b *testing.B) {
-	m := New[string, []string](8)
+	m := NewQueryMap(8)
 	m.Set("alpha", []string{"1", "2"})
 	m.Set("with space", []string{"two words", "x+y"})
 	m.Set("symbol", []string{"a&b=c"})
@@ -190,7 +190,7 @@ func BenchmarkMapEncode(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		encoded = Encode(&m)
+		encoded = m.Encode()
 	}
 
 	benchmarkEncoded = encoded
@@ -198,7 +198,7 @@ func BenchmarkMapEncode(b *testing.B) {
 
 func newBenchmarkMap(size int) Map[int, int] {
 	m := New[int, int](size)
-	for i := 0; i < size; i++ {
+	for i := range size {
 		m.Set(i, i)
 	}
 	return m
