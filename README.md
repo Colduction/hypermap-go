@@ -72,7 +72,6 @@ values are skipped.
 | Lookup and mutation | O(1) average for lookup, insert, delete, movement, and front/back access. |
 | Iteration           | Supports `for key, value := range m.Range()` with `iter.Seq2`.            |
 | Storage reuse       | `Clear` keeps allocated storage, while `Reset` releases it.               |
-| Serialization       | Supports arbitrary codec callbacks through an ordered snapshot.           |
 | Query encoding      | `QueryMap.Encode` renders `string`/`[]string` entries as a query string.  |
 
 > [!IMPORTANT]
