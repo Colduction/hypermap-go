@@ -60,8 +60,8 @@ m.Set("tags", []string{"math", "code"})
 fmt.Println(m.Encode()) // name=ada+lovelace&tags=math&tags=code
 ```
 
-`Encode` allocates once: a `nil` or empty map returns `""`, and keys with no
-values are skipped.
+> [!TIP]
+> `Encode` allocates once: a `nil` or empty map returns `""`.
 
 ## Features
 

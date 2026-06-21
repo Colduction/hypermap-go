@@ -264,8 +264,10 @@ func (m *Map[T, T2]) MoveToBack(key T) bool {
 	if ref == 0 {
 		return false
 	}
-	e := m.entries
-	tail := e[0].prev
+	var (
+		e    = m.entries
+		tail = e[0].prev
+	)
 	if tail == ref {
 		return true
 	}
@@ -408,10 +410,6 @@ func (qm *QueryMap) Encode() string {
 			entry = &e[ref]
 			next  = entry.next
 		)
-		if len(entry.value) == 0 {
-			ref = next
-			continue
-		}
 		for _, value := range entry.value {
 			if sb.Len() > 0 {
 				sb.WriteByte('&')
