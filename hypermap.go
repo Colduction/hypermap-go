@@ -94,8 +94,10 @@ func (m *Map[T, T2]) Has(key T) bool {
 // Set stores value for key and returns the replaced value when key is present.
 func (m *Map[T, T2]) Set(key T, value T2) (T2, bool) {
 	if ref := m.index[key]; ref != 0 {
-		entry := &m.entries[ref]
-		old := entry.value
+		var (
+			entry = &m.entries[ref]
+			old   = entry.value
+		)
 		entry.value = value
 		return old, true
 	}
@@ -144,14 +146,18 @@ func (m *Map[T, T2]) Reset() {
 // m is non-empty.
 func (m *Map[T, T2]) Front() (T, T2, bool) {
 	if len(m.entries) == 0 {
-		var zeroKey T
-		var zeroValue T2
+		var (
+			zeroKey   T
+			zeroValue T2
+		)
 		return zeroKey, zeroValue, false
 	}
 	ref := m.entries[0].next
 	if ref == 0 {
-		var zeroKey T
-		var zeroValue T2
+		var (
+			zeroKey   T
+			zeroValue T2
+		)
 		return zeroKey, zeroValue, false
 	}
 	entry := &m.entries[ref]
@@ -162,14 +168,18 @@ func (m *Map[T, T2]) Front() (T, T2, bool) {
 // is non-empty.
 func (m *Map[T, T2]) Back() (T, T2, bool) {
 	if len(m.entries) == 0 {
-		var zeroKey T
-		var zeroValue T2
+		var (
+			zeroKey   T
+			zeroValue T2
+		)
 		return zeroKey, zeroValue, false
 	}
 	ref := m.entries[0].prev
 	if ref == 0 {
-		var zeroKey T
-		var zeroValue T2
+		var (
+			zeroKey   T
+			zeroValue T2
+		)
 		return zeroKey, zeroValue, false
 	}
 	entry := &m.entries[ref]
@@ -181,14 +191,18 @@ func (m *Map[T, T2]) Back() (T, T2, bool) {
 func (m *Map[T, T2]) Next(key T) (T, T2, bool) {
 	ref := m.index[key]
 	if ref == 0 {
-		var zeroKey T
-		var zeroValue T2
+		var (
+			zeroKey   T
+			zeroValue T2
+		)
 		return zeroKey, zeroValue, false
 	}
 	next := m.entries[ref].next
 	if next == 0 {
-		var zeroKey T
-		var zeroValue T2
+		var (
+			zeroKey   T
+			zeroValue T2
+		)
 		return zeroKey, zeroValue, false
 	}
 	entry := &m.entries[next]
@@ -200,14 +214,18 @@ func (m *Map[T, T2]) Next(key T) (T, T2, bool) {
 func (m *Map[T, T2]) Prev(key T) (T, T2, bool) {
 	ref := m.index[key]
 	if ref == 0 {
-		var zeroKey T
-		var zeroValue T2
+		var (
+			zeroKey   T
+			zeroValue T2
+		)
 		return zeroKey, zeroValue, false
 	}
 	prev := m.entries[ref].prev
 	if prev == 0 {
-		var zeroKey T
-		var zeroValue T2
+		var (
+			zeroKey   T
+			zeroValue T2
+		)
 		return zeroKey, zeroValue, false
 	}
 	entry := &m.entries[prev]
@@ -220,13 +238,17 @@ func (m *Map[T, T2]) MoveToFront(key T) bool {
 	if ref == 0 {
 		return false
 	}
-	e := m.entries
-	head := e[0].next
+	var (
+		e    = m.entries
+		head = e[0].next
+	)
 	if head == ref {
 		return true
 	}
-	entry := &e[ref]
-	prev, next := entry.prev, entry.next
+	var (
+		entry      = &e[ref]
+		prev, next = entry.prev, entry.next
+	)
 	e[prev].next = next
 	e[next].prev = prev
 	entry.prev = 0
@@ -247,8 +269,10 @@ func (m *Map[T, T2]) MoveToBack(key T) bool {
 	if tail == ref {
 		return true
 	}
-	entry := &e[ref]
-	prev, next := entry.prev, entry.next
+	var (
+		entry      = &e[ref]
+		prev, next = entry.prev, entry.next
+	)
 	e[prev].next = next
 	e[next].prev = prev
 	entry.next = 0
@@ -262,19 +286,24 @@ func (m *Map[T, T2]) MoveToBack(key T) bool {
 // reports whether an entry is removed.
 func (m *Map[T, T2]) PopFront() (T, T2, bool) {
 	if len(m.entries) == 0 {
-		var zeroKey T
-		var zeroValue T2
+		var (
+			zeroKey   T
+			zeroValue T2
+		)
 		return zeroKey, zeroValue, false
 	}
 	ref := m.entries[0].next
 	if ref == 0 {
-		var zeroKey T
-		var zeroValue T2
+		var (
+			zeroKey   T
+			zeroValue T2
+		)
 		return zeroKey, zeroValue, false
 	}
-	entry := &m.entries[ref]
-	key := entry.key
-	value := entry.value
+	var (
+		entry      = &m.entries[ref]
+		key, value = entry.key, entry.value
+	)
 	m.deleteRef(ref, entry, key)
 	return key, value, true
 }
@@ -298,9 +327,8 @@ func (m *Map[T, T2]) PopBack() (T, T2, bool) {
 		return zeroKey, zeroValue, false
 	}
 	var (
-		entry = &m.entries[ref]
-		key   = entry.key
-		value = entry.value
+		entry      = &m.entries[ref]
+		key, value = entry.key, entry.value
 	)
 	m.deleteRef(ref, entry, key)
 	return key, value, true
@@ -310,12 +338,15 @@ func (m *Map[T, T2]) PopBack() (T, T2, bool) {
 // Range leaves remaining iteration behavior unspecified when yield mutates m.
 func (m *Map[T, T2]) Range() iter.Seq2[T, T2] {
 	return func(yield func(T, T2) bool) {
-		if len(m.entries) == 0 {
+		e := m.entries
+		if len(e) == 0 {
 			return
 		}
-		for ref := m.entries[0].next; ref != 0; {
-			entry := &m.entries[ref]
-			next := entry.next
+		for ref := e[0].next; ref != 0; {
+			var (
+				entry = &e[ref]
+				next  = entry.next
+			)
 			if !yield(entry.key, entry.value) {
 				return
 			}
@@ -344,12 +375,16 @@ func (qm *QueryMap) Encode() string {
 	if qm == nil || qm.Len() == 0 {
 		return ""
 	}
-	e := qm.entries
-	size := 0
+	var (
+		e    = qm.entries
+		size int
+	)
 	for ref := e[0].next; ref != 0; {
-		entry := &e[ref]
-		next := entry.next
-		values := entry.value
+		var (
+			entry  = &e[ref]
+			next   = entry.next
+			values = entry.value
+		)
 		if len(values) == 0 {
 			ref = next
 			continue
@@ -369,8 +404,10 @@ func (qm *QueryMap) Encode() string {
 	var sb strings.Builder
 	sb.Grow(size)
 	for ref := e[0].next; ref != 0; {
-		entry := &e[ref]
-		next := entry.next
+		var (
+			entry = &e[ref]
+			next  = entry.next
+		)
 		if len(entry.value) == 0 {
 			ref = next
 			continue
@@ -455,8 +492,10 @@ func shouldEscapeQuery(c byte) bool {
 // list.
 func (m *Map[T, T2]) addSlot(key T, value T2) int {
 	if m.free != 0 {
-		ref := m.free
-		entry := &m.entries[ref]
+		var (
+			ref   = m.free
+			entry = &m.entries[ref]
+		)
 		m.free = entry.next
 		entry.key = key
 		entry.value = value
@@ -470,8 +509,10 @@ func (m *Map[T, T2]) addSlot(key T, value T2) int {
 
 // linkBack appends ref to the tail of the circular list.
 func (m *Map[T, T2]) linkBack(ref int) {
-	tail := m.entries[0].prev
-	entry := &m.entries[ref]
+	var (
+		tail  = m.entries[0].prev
+		entry = &m.entries[ref]
+	)
 	entry.prev = tail
 	entry.next = 0
 	m.entries[tail].next = ref
