@@ -30,7 +30,8 @@ func BenchmarkGet(b *testing.B) {
 	b.Run("lorenzosaino", benchmarkLorenzoGet)
 }
 
-// BenchmarkSetReplace measures replacing values without changing key order.
+// BenchmarkSetReplace measures each package's replacement-only fast path when
+// available, without changing key order.
 func BenchmarkSetReplace(b *testing.B) {
 	b.Run("hypermap", benchmarkHypermapSetReplace)
 	b.Run("wk8", benchmarkWK8SetReplace)
@@ -46,14 +47,16 @@ func BenchmarkDeleteSet(b *testing.B) {
 	b.Run("lorenzosaino", benchmarkLorenzoDeleteSet)
 }
 
-// BenchmarkMoveToFrontBack measures moving one key to both ends of the map.
+// BenchmarkMoveToFrontBack measures two effective relinks of one existing key:
+// back/middle to front, then front to back.
 func BenchmarkMoveToFrontBack(b *testing.B) {
 	b.Run("hypermap", benchmarkHypermapMoveToFrontBack)
 	b.Run("wk8", benchmarkWK8MoveToFrontBack)
 	b.Run("lorenzosaino", benchmarkLorenzoMoveToFrontBack)
 }
 
-// BenchmarkRange measures a complete insertion-order traversal.
+// BenchmarkRange measures each package's fastest non-allocating complete
+// insertion-order traversal API.
 func BenchmarkRange(b *testing.B) {
 	b.Run("hypermap", benchmarkHypermapRange)
 	b.Run("wk8", benchmarkWK8Range)
@@ -138,7 +141,7 @@ func benchmarkHypermapSetReplace(b *testing.B) {
 	)
 	b.ReportAllocs()
 	for b.Loop() {
-		value, ok = m.Set(i&benchmarkMask, i)
+		value, ok = m.Replace(i&benchmarkMask, i)
 		i++
 	}
 	benchmarkValue, benchmarkOK = value, ok
@@ -258,52 +261,40 @@ func benchmarkLorenzoDeleteSet(b *testing.B) {
 
 func benchmarkHypermapMoveToFrontBack(b *testing.B) {
 	m := newHypermap()
-	var (
-		ok bool
-		i  int
-	)
+	const key = benchmarkSize / 2
+	var ok bool
 	b.ReportAllocs()
 	for b.Loop() {
-		key := i & benchmarkMask
 		ok = m.MoveToFront(key)
 		ok = m.MoveToBack(key) && ok
-		i++
 	}
 	benchmarkOK = ok
 }
 
 func benchmarkWK8MoveToFrontBack(b *testing.B) {
 	m := newWK8Map()
-	var (
-		err error
-		i   int
-	)
+	const key = benchmarkSize / 2
+	var err error
 	b.ReportAllocs()
 	for b.Loop() {
-		key := i & benchmarkMask
 		err = m.MoveToFront(key)
 		if err == nil {
 			err = m.MoveToBack(key)
 		}
-		i++
 	}
 	benchmarkErr = err
 }
 
 func benchmarkLorenzoMoveToFrontBack(b *testing.B) {
 	m := newLorenzoMap()
-	var (
-		err error
-		i   int
-	)
+	const key = benchmarkSize / 2
+	var err error
 	b.ReportAllocs()
 	for b.Loop() {
-		key := i & benchmarkMask
 		err = m.MoveToFront(key)
 		if err == nil {
 			err = m.MoveToBack(key)
 		}
-		i++
 	}
 	benchmarkErr = err
 }
@@ -311,11 +302,13 @@ func benchmarkLorenzoMoveToFrontBack(b *testing.B) {
 func benchmarkHypermapRange(b *testing.B) {
 	m := newHypermap()
 	var sum int
+	yield := func(key, value int) bool {
+		sum += key + value
+		return true
+	}
 	b.ReportAllocs()
 	for b.Loop() {
-		for key, value := range m.Range() {
-			sum += key + value
-		}
+		m.RangeFunc(yield)
 	}
 	benchmarkValue = sum
 }
@@ -335,11 +328,13 @@ func benchmarkWK8Range(b *testing.B) {
 func benchmarkElliottRange(b *testing.B) {
 	m := newElliottMap()
 	var sum int
+	yield := func(key, value int) bool {
+		sum += key + value
+		return true
+	}
 	b.ReportAllocs()
 	for b.Loop() {
-		for key, value := range m.AllFromFront() {
-			sum += key + value
-		}
+		m.AllFromFront()(yield)
 	}
 	benchmarkValue = sum
 }

@@ -5,13 +5,12 @@
 `hypermap-go` provides `hypermap.Map`: a compact, generic, insertion-ordered map for Go.
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/colduction/hypermap-go.svg)](https://pkg.go.dev/github.com/colduction/hypermap-go)
-[![Go Report Card](https://goreportcard.com/badge/github.com/colduction/hypermap-go)](https://goreportcard.com/report/github.com/colduction/hypermap-go)
 ![GitHub License](https://img.shields.io/github/license/Colduction/hypermap-go)
 
 </div>
 
 > [!TIP]
-> Use `hypermap.New[K, V](capacity)` when the maximum live entry count is known; it reserves storage for steadier write performance.
+> Use `hypermap.New[K, V](capacity)` when the maximum live entry count is known; it avoids growth during the initial fill. Different-key churn may still grow the hash index to preserve amortized write cost.
 
 ## Install
 
@@ -61,47 +60,54 @@ fmt.Println(m.Encode()) // name=ada+lovelace&tags=math&tags=code
 ```
 
 > [!TIP]
-> `Encode` allocates once: a `nil` or empty map returns `""`.
+> `Encode` allocates once when it emits output. A nil/empty map, or one whose value slices are all empty, returns `""` without that output allocation.
 
 ## Features
 
-| Capability          | Behavior                                                                  |
-| ------------------- | ------------------------------------------------------------------------- |
-| Zero value          | Ready to use without initialization.                                      |
-| Ordering            | Preserves insertion order; replacing a value keeps the key in place.      |
-| Lookup and mutation | O(1) average for lookup, insert, delete, movement, and front/back access. |
-| Iteration           | Supports `for key, value := range m.Range()` with `iter.Seq2`.            |
-| Storage reuse       | `Clear` keeps allocated storage, while `Reset` releases it.               |
-| Query encoding      | `QueryMap.Encode` renders `string`/`[]string` entries as a query string.  |
+| Capability          | Behavior                                                                       |
+| ------------------- | ------------------------------------------------------------------------------ |
+| Zero value          | Ready to use without initialization.                                           |
+| Ordering            | Preserves insertion order; replacing a value keeps the key in place.           |
+| Lookup and mutation | O(1) average for lookup, insert, delete, movement, and front/back access.      |
+| Replacement         | `Replace` updates only an existing key; `Set` inserts or replaces.             |
+| Iteration           | `Range` provides `iter.Seq2`; `RangeFunc` is the lower-overhead callback form. |
+| Storage reuse       | `Clear` keeps allocated storage, while `Reset` releases it.                    |
+| Query encoding      | `QueryMap.Encode` renders `string`/`[]string` entries as a query string.       |
 
 > [!IMPORTANT]
-> `Map` does not synchronize access. Share a map across goroutines only with external synchronization, or shard independent maps by key or worker for write-heavy services.
+> Do not copy a `Map` after initialization or mutation. It does not synchronize access; share one across goroutines only with external synchronization, or shard independent maps by key or worker for write-heavy services.
 
 ## Benchmarks
 
-Median time with 4,096 `int`/`int` entries; lower is better and the fastest
-result is bold.
+Median time with 4,096 `int`/`int` entries; lower is better. These are the
+maintained headline workloads, and the fastest result in each row is bold.
 
-| Operation       |     hypermap |          wk8 | elliotchance | lorenzosaino | vs best rival |
-| --------------- | -----------: | -----------: | -----------: | -----------: | ------------: |
-| Get             |     5.673 ns | **5.358 ns** |     5.364 ns |     5.407 ns |   5.9% slower |
-| Replace         |     9.644 ns |     10.96 ns |     12.00 ns | **7.707 ns** |  25.1% slower |
-| Delete + set    | **35.65 ns** |     90.98 ns |     62.38 ns |     74.91 ns |  42.8% faster |
-| Move front/back | **14.32 ns** |     18.62 ns |            — |     17.27 ns |  17.1% faster |
-| Range all       |     6.622 µs |     10.00 µs |     6.293 µs | **4.953 µs** |  33.7% slower |
-| Fill new map    | **77.14 µs** |     175.2 µs |     120.2 µs |     268.9 µs |  35.8% faster |
+| Operation       |     hypermap |      wk8 | elliotchance | lorenzosaino | vs best rival |
+| --------------- | -----------: | -------: | -----------: | -----------: | ------------: |
+| Get             | **4.799 ns** | 5.413 ns |     5.457 ns |     5.480 ns |  11.3% faster |
+| Replace         | **5.897 ns** | 10.46 ns |     12.10 ns |     7.751 ns |  23.9% faster |
+| Delete + set    | **24.14 ns** | 91.35 ns |     63.05 ns |     75.04 ns |  61.7% faster |
+| Move front/back | **16.03 ns** | 27.07 ns |            — |     27.34 ns |  40.8% faster |
+| Range all       | **4.030 µs** | 10.13 µs |     4.653 µs |     4.863 µs |  13.4% faster |
+| Fill new map    | **53.51 µs** | 175.4 µs |     119.9 µs |     267.4 µs |  55.4% faster |
 
-`hypermap` is strongest under churn and construction: delete-and-set performs
-with **0 B/op and 0 allocs/op** versus 32–56 B/op and 1–2 allocations for the
-alternatives, while filling the map takes 19 allocations versus 4,114–8,213.
+Every operation on an already-populated Hypermap in the table is **0 B/op and
+0 allocs/op**.
+Filling a capacity-sized map uses 147,456 B and 2 allocations, versus
+278,896–492,776 B and 4,114–8,213 allocations for the alternatives. The broader
+suite also measures misses, strings, tiny maps, fragmented traversal, early
+stop, unhinted construction, and different-key churn.
 
 <details>
 <summary>Methodology and reproduction</summary>
 
-Results are medians from 10 one-second samples using Go 1.26.4 on Windows 11
-`amd64` and an AMD Ryzen 9 7950X, restricted to one logical CPU. Capacity hints
-are used where supported. `Range all` and `Fill new map` process all 4,096
-entries. Replace timings had up to 20% sample variance.
+Results are medians from 10 one-second samples using Go 1.26.5 on Windows 11
+`amd64` and an AMD Ryzen 9 7950X, pinned to logical CPU 2 with `GOMAXPROCS=1`.
+Capacity hints are used where supported. `Range all` and `Fill new map` process
+all 4,096 entries. Replacement and traversal use each package's fastest
+non-allocating API: Hypermap uses `Replace` and `RangeFunc`. Timings can vary
+with map seed and system clock state; the table reports ten-sample medians, not
+universal dominance.
 
 Compared versions:
 
@@ -109,14 +115,24 @@ Compared versions:
 - [`elliotchance/orderedmap/v3` v3.1.0](https://github.com/elliotchance/orderedmap/tree/v3.1.0)
 - [`lorenzosaino/go-orderedmap` cf642d9](https://github.com/lorenzosaino/go-orderedmap/commit/cf642d91fab6)
 
-The source and pinned dependency versions are in [`benchmarks`](benchmarks):
+The source, validation checks, and pinned dependency versions are in
+[`benchmarks`](benchmarks). The maintained Windows headline command is:
 
-```sh
+```powershell
 cd benchmarks
-go test -run '^$' -bench . -benchmem -benchtime=1s -count=10 -cpu=1
+$benchProcess = Get-Process -Id $PID
+$benchProcess.ProcessorAffinity = [IntPtr]4
+$benchProcess.PriorityClass = 'High'
+$headline = '^(BenchmarkGet|BenchmarkSetReplace|BenchmarkDeleteSet|BenchmarkMoveToFrontBack|BenchmarkRange|BenchmarkFill)$'
+go test -run '^$' -bench $headline -benchmem -benchtime=100ms -count=1 -cpu=1 | Out-Null
+go test -run '^$' -bench $headline -benchmem -benchtime=1s -count=10 -cpu=1
 ```
 
-Microbenchmark results vary with workload, Go version, and hardware.
+Run the broader workload matrix with `-bench '^BenchmarkWorkload'`. Built-in
+map fast paths can still win for some 8- or 64-entry operations, so the table is
+not a claim of universal superiority across all key types, sizes, or machines.
+See [the performance design and tradeoffs](docs/performance.md) for the data
+layout, research basis, allocation caveats, and complete protocol.
 
 </details>
 

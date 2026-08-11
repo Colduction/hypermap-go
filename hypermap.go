@@ -3,6 +3,7 @@
 package hypermap
 
 import (
+	"hash/maphash"
 	"iter"
 	"strings"
 )
@@ -12,62 +13,72 @@ const queryEscapeHex = "0123456789ABCDEF"
 // orderedMap stores its entries in a slice whose first element (index 0) is a
 // permanent sentinel. The sentinel anchors a circular doubly-linked list, so
 // entries[0].next is the head, entries[0].prev is the tail, and an empty list
-// is the sentinel pointing at itself. Anchoring the list this way removes the
-// need for separate head/tail fields and lets link/unlink run without
-// boundary checks. Deleted slots are recycled through a singly-linked free
-// chain rooted at free, so steady-state insert/delete reuses storage instead
-// of growing it.
+// is the sentinel pointing at itself. The hash index stores stable slice
+// indices rather than pointers, so entries may relocate without repair.
+// Deleted slots are recycled through a singly-linked free chain rooted at free.
 type orderedMap[T comparable, T2 any] struct {
-	index   map[T]int
-	entries []entries[T, T2]
-	free    int
+	index      hashIndex[T, T2]
+	entries    []entries[T, T2]
+	free       uint32
+	fragmented bool
 }
 
 type entries[T comparable, T2 any] struct {
 	key        T
 	value      T2
-	prev, next int
+	prev, next uint32
 }
 
 // Map is an insertion-ordered hash map.
 //
 // The zero value is ready to use. Single-key lookup, insertion, deletion,
 // movement, and front/back access are O(1) average. Use [New] or [Map.Init]
-// with the maximum live entry count to keep steady-state writes within existing
-// storage. Do not copy a Map after first use. Map does not synchronize access;
-// callers that share a [Map] across goroutines need external synchronization.
+// with the maximum live entry count to avoid storage growth during the initial
+// fill. Heavy churn that replaces deleted keys with different keys may grow
+// hash-index storage to preserve amortized write cost.
+// Map values must not be copied after initialization or mutation.
+// A Map may be transferred by value only when the source is no longer used.
+// Map does not synchronize access; callers that share a [Map] across goroutines
+// need external synchronization.
 // Use independent [Map] values per shard or worker when write contention is
 // expected.
 type Map[T comparable, T2 any] orderedMap[T, T2]
 
 // New returns an initialized [Map] with storage reserved for up to capacity
 // live entries.
+// New panics if capacity is negative or exceeds the supported maximum.
 func New[T comparable, T2 any](capacity int) Map[T, T2] {
 	var m Map[T, T2]
 	m.Init(capacity)
 	return m
 }
 
-// Init prepares m with storage reserved for up to capacity live entries.
+// Init discards m's contents and backing storage, then reserves space for up to
+// capacity live entries.
+// Init panics if capacity is negative or exceeds the supported maximum.
 func (m *Map[T, T2]) Init(capacity int) {
 	if capacity < 0 {
 		panic("hypermap: negative ordered map capacity")
+	}
+	if uint64(capacity) > indexMaxCapacity || capacity == int(^uint(0)>>1) {
+		panic("hypermap: ordered map capacity too large")
 	}
 	var zero Map[T, T2]
 	*m = zero
 	if capacity == 0 {
 		return
 	}
-	m.index = make(map[T]int, capacity)
+	m.index = makeHashIndex[T, T2](capacity)
 	m.entries = make([]entries[T, T2], 1, capacity+1)
 }
 
 // Len reports the number of entries in m.
 func (m *Map[T, T2]) Len() int {
-	return len(m.index)
+	return int(m.index.used)
 }
 
-// Cap reports the maximum live entries m can hold before growing its slot slice.
+// Cap reports the arena's reserved live-entry capacity. The hash index may grow
+// independently during different-key churn.
 func (m *Map[T, T2]) Cap() int {
 	c := cap(m.entries)
 	if c == 0 {
@@ -78,65 +89,130 @@ func (m *Map[T, T2]) Cap() int {
 
 // Get returns the value for key and reports whether key is present.
 func (m *Map[T, T2]) Get(key T) (T2, bool) {
-	ref := m.index[key]
-	if ref == 0 {
-		var zero T2
-		return zero, false
+	if len(m.index.groups) != 0 {
+		hash := maphash.Comparable(m.index.seed, key)
+		mask := len(m.index.groups) - 1
+		groupIndex := int(hash>>7) & mask
+		tag := hash & 0x7f
+		var step int
+		for {
+			group := &m.index.groups[groupIndex]
+			matches := indexMatchTag(group.control, tag)
+			for matches != 0 {
+				slot := indexFirstMatch(matches)
+				entry := &m.entries[group.refs[slot]]
+				if entry.key == key {
+					return entry.value, true
+				}
+				matches &= matches - 1
+			}
+			if indexMatchEmpty(group.control) != 0 {
+				break
+			}
+			step++
+			groupIndex = (groupIndex + step) & mask
+		}
 	}
-	return m.entries[ref].value, true
-}
-
-// Has reports whether key is present in m.
-func (m *Map[T, T2]) Has(key T) bool {
-	return m.index[key] != 0
-}
-
-// Set stores value for key and returns the replaced value when key is present.
-func (m *Map[T, T2]) Set(key T, value T2) (T2, bool) {
-	if ref := m.index[key]; ref != 0 {
-		var (
-			entry = &m.entries[ref]
-			old   = entry.value
-		)
-		entry.value = value
-		return old, true
-	}
-	if m.index == nil {
-		m.index = make(map[T]int, 1)
-	}
-	if len(m.entries) == 0 {
-		m.entries = append(m.entries, entries[T, T2]{}) // sentinel
-	}
-	ref := m.addSlot(key, value)
-	m.index[key] = ref
-	m.linkBack(ref)
 	var zero T2
 	return zero, false
 }
 
-// Delete removes key and returns the removed value when key is present.
-func (m *Map[T, T2]) Delete(key T) (T2, bool) {
-	ref := m.index[key]
-	if ref == 0 {
+// Has reports whether key is present in m.
+func (m *Map[T, T2]) Has(key T) bool {
+	return m.index.entry(m.entries, key) != nil
+}
+
+// Set stores value for key, returns the previous value, and reports whether key
+// was already present.
+// It panics if inserting key would exceed the supported maximum size.
+func (m *Map[T, T2]) Set(key T, value T2) (T2, bool) {
+	if len(m.index.groups) == 0 {
+		m.index = makeHashIndex[T, T2](1)
+	}
+	if len(m.entries) == 0 {
+		m.entries = make([]entries[T, T2], 1, 2) // sentinel
+	}
+	for {
+		ref, slot, tag := m.index.findInsert(m.entries, key)
+		if ref != 0 {
+			entry := &m.entries[ref]
+			old := entry.value
+			entry.value = value
+			return old, true
+		}
+		groupIndex, groupSlot := indexSplitSlot(slot)
+		control := indexControlAt(m.index.groups[groupIndex].control, groupSlot)
+		if control == indexEmptyControl && uint64(m.index.filled) >= m.index.maxLoad() {
+			m.index.rebuild(m.entries, m.index.growForInsert())
+			continue
+		}
+		ref = m.addSlot(key, value)
+		m.index.insert(slot, tag, ref)
+		m.linkBack(ref)
 		var zero T2
 		return zero, false
 	}
-	old := m.entries[ref].value
-	m.deleteRef(ref, &m.entries[ref], key)
+}
+
+// Replace stores value for key, returns the previous value, and reports whether
+// key was present. It leaves m unchanged when key is absent.
+func (m *Map[T, T2]) Replace(key T, value T2) (old T2, replaced bool) {
+	if len(m.index.groups) != 0 {
+		hash := maphash.Comparable(m.index.seed, key)
+		mask := len(m.index.groups) - 1
+		groupIndex := int(hash>>7) & mask
+		tag := hash & 0x7f
+		var step int
+		for {
+			group := &m.index.groups[groupIndex]
+			matches := indexMatchTag(group.control, tag)
+			for matches != 0 {
+				slot := indexFirstMatch(matches)
+				entry := &m.entries[group.refs[slot]]
+				if entry.key == key {
+					old = entry.value
+					entry.value = value
+					return old, true
+				}
+				matches &= matches - 1
+			}
+			if indexMatchEmpty(group.control) != 0 {
+				break
+			}
+			step++
+			groupIndex = (groupIndex + step) & mask
+		}
+	}
+	return old, false
+}
+
+// Delete removes key, returns the removed value, and reports whether key was
+// present.
+func (m *Map[T, T2]) Delete(key T) (T2, bool) {
+	ref, slot, ok := m.index.lookup(m.entries, key)
+	if !ok {
+		var zero T2
+		return zero, false
+	}
+	entry := &m.entries[ref]
+	old := entry.value
+	m.index.deleteSlot(slot)
+	m.deleteEntry(ref, entry)
 	return old, true
 }
 
 // Clear removes all entries while keeping allocated storage for reuse.
 func (m *Map[T, T2]) Clear() {
-	clear(m.index)
+	m.index.clear()
 	if len(m.entries) != 0 {
 		clear(m.entries)
-		m.entries = m.entries[:1] // keep the zeroed sentinel
+		m.entries = m.entries[:1]
 	}
 	m.free = 0
+	m.fragmented = false
 }
 
-// Reset removes all entries and releases m backing storage.
+// Reset removes all entries and releases m's backing storage.
 func (m *Map[T, T2]) Reset() {
 	var zero Map[T, T2]
 	*m = zero
@@ -189,15 +265,15 @@ func (m *Map[T, T2]) Back() (T, T2, bool) {
 // Next returns the key and value after key in insertion order and reports
 // whether key has a successor.
 func (m *Map[T, T2]) Next(key T) (T, T2, bool) {
-	ref := m.index[key]
-	if ref == 0 {
+	current := m.index.entry(m.entries, key)
+	if current == nil {
 		var (
 			zeroKey   T
 			zeroValue T2
 		)
 		return zeroKey, zeroValue, false
 	}
-	next := m.entries[ref].next
+	next := current.next
 	if next == 0 {
 		var (
 			zeroKey   T
@@ -212,15 +288,15 @@ func (m *Map[T, T2]) Next(key T) (T, T2, bool) {
 // Prev returns the key and value before key in insertion order and reports
 // whether key has a predecessor.
 func (m *Map[T, T2]) Prev(key T) (T, T2, bool) {
-	ref := m.index[key]
-	if ref == 0 {
+	current := m.index.entry(m.entries, key)
+	if current == nil {
 		var (
 			zeroKey   T
 			zeroValue T2
 		)
 		return zeroKey, zeroValue, false
 	}
-	prev := m.entries[ref].prev
+	prev := current.prev
 	if prev == 0 {
 		var (
 			zeroKey   T
@@ -232,23 +308,22 @@ func (m *Map[T, T2]) Prev(key T) (T, T2, bool) {
 	return entry.key, entry.value, true
 }
 
-// MoveToFront moves key to the front of m when key is present.
+// MoveToFront moves key to the front of m and reports whether key was present.
 func (m *Map[T, T2]) MoveToFront(key T) bool {
-	ref := m.index[key]
+	ref := m.index.get(m.entries, key)
 	if ref == 0 {
 		return false
 	}
 	var (
-		e    = m.entries
-		head = e[0].next
+		e     = m.entries
+		head  = e[0].next
+		entry = &e[ref]
 	)
 	if head == ref {
 		return true
 	}
-	var (
-		entry      = &e[ref]
-		prev, next = entry.prev, entry.next
-	)
+	m.fragmented = true
+	prev, next := entry.prev, entry.next
 	e[prev].next = next
 	e[next].prev = prev
 	entry.prev = 0
@@ -258,23 +333,22 @@ func (m *Map[T, T2]) MoveToFront(key T) bool {
 	return true
 }
 
-// MoveToBack moves key to the back of m when key is present.
+// MoveToBack moves key to the back of m and reports whether key was present.
 func (m *Map[T, T2]) MoveToBack(key T) bool {
-	ref := m.index[key]
+	ref := m.index.get(m.entries, key)
 	if ref == 0 {
 		return false
 	}
 	var (
-		e    = m.entries
-		tail = e[0].prev
+		e     = m.entries
+		tail  = e[0].prev
+		entry = &e[ref]
 	)
 	if tail == ref {
 		return true
 	}
-	var (
-		entry      = &e[ref]
-		prev, next = entry.prev, entry.next
-	)
+	m.fragmented = true
+	prev, next := entry.prev, entry.next
 	e[prev].next = next
 	e[next].prev = prev
 	entry.next = 0
@@ -306,7 +380,8 @@ func (m *Map[T, T2]) PopFront() (T, T2, bool) {
 		entry      = &m.entries[ref]
 		key, value = entry.key, entry.value
 	)
-	m.deleteRef(ref, entry, key)
+	m.index.deleteRef(m.entries, key, ref)
+	m.deleteEntry(ref, entry)
 	return key, value, true
 }
 
@@ -332,28 +407,43 @@ func (m *Map[T, T2]) PopBack() (T, T2, bool) {
 		entry      = &m.entries[ref]
 		key, value = entry.key, entry.value
 	)
-	m.deleteRef(ref, entry, key)
+	m.index.deleteRef(m.entries, key, ref)
+	m.deleteEntry(ref, entry)
 	return key, value, true
 }
 
 // Range returns an [iter.Seq2] over each key and value in insertion order.
 // Range leaves remaining iteration behavior unspecified when yield mutates m.
 func (m *Map[T, T2]) Range() iter.Seq2[T, T2] {
-	return func(yield func(T, T2) bool) {
-		e := m.entries
-		if len(e) == 0 {
-			return
-		}
-		for ref := e[0].next; ref != 0; {
-			var (
-				entry = &e[ref]
-				next  = entry.next
-			)
+	return m.RangeFunc
+}
+
+// RangeFunc calls yield for each key and value in insertion order until yield
+// returns false. RangeFunc leaves remaining iteration behavior unspecified when
+// yield mutates m.
+func (m *Map[T, T2]) RangeFunc(yield func(T, T2) bool) {
+	e := m.entries
+	if len(e) == 0 {
+		return
+	}
+	if !m.fragmented {
+		for ref := 1; ref < len(e); ref++ {
+			entry := &e[ref]
 			if !yield(entry.key, entry.value) {
 				return
 			}
-			ref = next
 		}
+		return
+	}
+	for ref := e[0].next; ref != 0; {
+		var (
+			entry = &e[ref]
+			next  = entry.next
+		)
+		if !yield(entry.key, entry.value) {
+			return
+		}
+		ref = next
 	}
 }
 
@@ -366,13 +456,14 @@ type QueryMap struct {
 
 // NewQueryMap returns an initialized [QueryMap] with storage reserved for up to
 // capacity live entries.
+// NewQueryMap panics if capacity is negative or exceeds the supported maximum.
 func NewQueryMap(capacity int) QueryMap {
 	return QueryMap{New[string, []string](capacity)}
 }
 
 // Encode returns qm encoded as URL query parameters in key insertion order.
-// Values for each key are encoded in slice order. A nil or empty [QueryMap]
-// encodes to an empty string.
+// Values for each key are encoded in slice order. A nil receiver or empty
+// [QueryMap] encodes to an empty string.
 func (qm *QueryMap) Encode() string {
 	if qm == nil || qm.Len() == 0 {
 		return ""
@@ -488,7 +579,7 @@ func shouldEscapeQuery(c byte) bool {
 // addSlot reserves a slot for key/value and returns its slice index, reusing a
 // freed slot when one is available. The caller links the returned slot into the
 // list.
-func (m *Map[T, T2]) addSlot(key T, value T2) int {
+func (m *Map[T, T2]) addSlot(key T, value T2) uint32 {
 	if m.free != 0 {
 		var (
 			ref   = m.free
@@ -501,12 +592,16 @@ func (m *Map[T, T2]) addSlot(key T, value T2) int {
 		entry.next = 0
 		return ref
 	}
+	if uint64(len(m.entries)) > uint64(^uint32(0)) {
+		panic("hypermap: ordered map capacity too large")
+	}
+	ref := uint32(len(m.entries))
 	m.entries = append(m.entries, entries[T, T2]{key: key, value: value})
-	return len(m.entries) - 1
+	return ref
 }
 
 // linkBack appends ref to the tail of the circular list.
-func (m *Map[T, T2]) linkBack(ref int) {
+func (m *Map[T, T2]) linkBack(ref uint32) {
 	var (
 		tail  = m.entries[0].prev
 		entry = &m.entries[ref]
@@ -525,11 +620,11 @@ func (m *Map[T, T2]) unlink(entry *entries[T, T2]) {
 	m.entries[entry.next].prev = entry.prev
 }
 
-// deleteRef removes entry (the slot at ref) from the list and pushes its slot
-// onto the free chain for reuse by a later insert.
-func (m *Map[T, T2]) deleteRef(ref int, entry *entries[T, T2], key T) {
-	delete(m.index, key)
+// deleteEntry removes entry from the list and pushes its slot onto the free
+// chain for reuse by a later insert. Its index slot must already be removed.
+func (m *Map[T, T2]) deleteEntry(ref uint32, entry *entries[T, T2]) {
 	m.unlink(entry)
+	m.fragmented = true
 	var (
 		zeroKey   T
 		zeroValue T2
