@@ -234,7 +234,8 @@ func BenchmarkWorkloadChurnDifferentKeys(b *testing.B) {
 	}
 }
 
-// BenchmarkWorkloadRangeFragmented measures full traversal after interleaved deletions.
+// BenchmarkWorkloadRangeFragmented measures full traversal after interleaved
+// deletions, through the same helpers as [BenchmarkRange].
 func BenchmarkWorkloadRangeFragmented(b *testing.B) {
 	for _, size := range workloadSizes {
 		b.Run("size="+strconv.Itoa(size), func(b *testing.B) {
@@ -254,7 +255,8 @@ func BenchmarkWorkloadRangeFragmented(b *testing.B) {
 	}
 }
 
-// BenchmarkWorkloadRangeEarlyStop measures traversal stopped after four entries.
+// BenchmarkWorkloadRangeEarlyStop measures traversal stopped after four entries,
+// through helpers that keep callbacks inlinable as in [BenchmarkRange].
 func BenchmarkWorkloadRangeEarlyStop(b *testing.B) {
 	for _, size := range workloadSizes {
 		b.Run("size="+strconv.Itoa(size), func(b *testing.B) {
@@ -555,13 +557,9 @@ func benchmarkHypermapRangeFragmentedWorkload(b *testing.B, size int) {
 	deleteOddHypermapWorkloadKeys(m, size)
 	keys, values = fragmentedIntWorkloadData(size)
 	var sum int
-	yield := func(key, value int) bool {
-		sum += key + value
-		return true
-	}
 	b.ReportAllocs()
 	for b.Loop() {
-		m.RangeFunc(yield)
+		sum += sumHypermap(m)
 	}
 	workloadValue = sum
 	validateRangeWorkloadResult(b, sum, keys, values)
@@ -576,9 +574,7 @@ func benchmarkWK8RangeFragmentedWorkload(b *testing.B, size int) {
 	var sum int
 	b.ReportAllocs()
 	for b.Loop() {
-		for pair := m.Oldest(); pair != nil; pair = pair.Next() {
-			sum += pair.Key + pair.Value
-		}
+		sum += sumWK8(m)
 	}
 	workloadValue = sum
 	validateRangeWorkloadResult(b, sum, keys, values)
@@ -591,13 +587,9 @@ func benchmarkElliottRangeFragmentedWorkload(b *testing.B, size int) {
 	deleteOddElliottWorkloadKeys(m, size)
 	keys, values = fragmentedIntWorkloadData(size)
 	var sum int
-	yield := func(key, value int) bool {
-		sum += key + value
-		return true
-	}
 	b.ReportAllocs()
 	for b.Loop() {
-		m.AllFromFront()(yield)
+		sum += sumElliott(m)
 	}
 	workloadValue = sum
 	validateRangeWorkloadResult(b, sum, keys, values)
@@ -610,96 +602,109 @@ func benchmarkLorenzoRangeFragmentedWorkload(b *testing.B, size int) {
 	deleteOddLorenzoWorkloadKeys(m, size)
 	keys, values = fragmentedIntWorkloadData(size)
 	var sum int
-	yield := func(key, value int) bool {
-		sum += key + value
-		return true
-	}
 	b.ReportAllocs()
 	for b.Loop() {
-		m.Range(yield)
+		sum += sumLorenzo(m)
 	}
 	workloadValue = sum
 	validateRangeWorkloadResult(b, sum, keys, values)
 	validateWorkloadState(b, lorenzoWorkloadState(m), keys, values)
 }
 
+const earlyStopLimit = 4
+
 func benchmarkHypermapRangeEarlyStopWorkload(b *testing.B, size int) {
-	const limit = 4
 	keys, values := intWorkloadData(size)
 	m := newHypermapWorkloadMap(keys, values)
 	var visits, sum int
-	yield := func(key, value int) bool {
-		visits++
-		sum += key + value
-		return visits%limit != 0
-	}
 	b.ReportAllocs()
 	for b.Loop() {
-		m.RangeFunc(yield)
+		v, s := earlyStopHypermap(m)
+		visits, sum = visits+v, sum+s
 	}
 	workloadValue = sum
-	validateEarlyStopWorkloadResult(b, visits, sum, keys[:limit], values[:limit])
+	validateEarlyStopWorkloadResult(b, visits, sum, keys[:earlyStopLimit], values[:earlyStopLimit])
 	validateWorkloadState(b, hypermapWorkloadState(m), keys, values)
 }
 
 func benchmarkWK8RangeEarlyStopWorkload(b *testing.B, size int) {
-	const limit = 4
 	keys, values := intWorkloadData(size)
 	m := newWK8WorkloadMap(keys, values)
 	var visits, sum int
 	b.ReportAllocs()
 	for b.Loop() {
-		seen := 0
-		for pair := m.Oldest(); pair != nil; pair = pair.Next() {
-			visits++
-			sum += pair.Key + pair.Value
-			seen++
-			if seen == limit {
-				break
-			}
-		}
+		v, s := earlyStopWK8(m)
+		visits, sum = visits+v, sum+s
 	}
 	workloadValue = sum
-	validateEarlyStopWorkloadResult(b, visits, sum, keys[:limit], values[:limit])
+	validateEarlyStopWorkloadResult(b, visits, sum, keys[:earlyStopLimit], values[:earlyStopLimit])
 	validateWorkloadState(b, wk8WorkloadState(m), keys, values)
 }
 
 func benchmarkElliottRangeEarlyStopWorkload(b *testing.B, size int) {
-	const limit = 4
 	keys, values := intWorkloadData(size)
 	m := newElliottWorkloadMap(keys, values)
 	var visits, sum int
-	yield := func(key, value int) bool {
-		visits++
-		sum += key + value
-		return visits%limit != 0
-	}
 	b.ReportAllocs()
 	for b.Loop() {
-		m.AllFromFront()(yield)
+		v, s := earlyStopElliott(m)
+		visits, sum = visits+v, sum+s
 	}
 	workloadValue = sum
-	validateEarlyStopWorkloadResult(b, visits, sum, keys[:limit], values[:limit])
+	validateEarlyStopWorkloadResult(b, visits, sum, keys[:earlyStopLimit], values[:earlyStopLimit])
 	validateWorkloadState(b, elliottWorkloadState(m), keys, values)
 }
 
 func benchmarkLorenzoRangeEarlyStopWorkload(b *testing.B, size int) {
-	const limit = 4
 	keys, values := intWorkloadData(size)
 	m := newLorenzoWorkloadMap(keys, values)
 	var visits, sum int
-	yield := func(key, value int) bool {
-		visits++
-		sum += key + value
-		return visits%limit != 0
-	}
 	b.ReportAllocs()
 	for b.Loop() {
-		m.Range(yield)
+		v, s := earlyStopLorenzo(m)
+		visits, sum = visits+v, sum+s
 	}
 	workloadValue = sum
-	validateEarlyStopWorkloadResult(b, visits, sum, keys[:limit], values[:limit])
+	validateEarlyStopWorkloadResult(b, visits, sum, keys[:earlyStopLimit], values[:earlyStopLimit])
 	validateWorkloadState(b, lorenzoWorkloadState(m), keys, values)
+}
+
+func earlyStopHypermap(m *hypermap.Map[int, int]) (visits, sum int) {
+	m.RangeFunc(func(key, value int) bool {
+		visits++
+		sum += key + value
+		return visits != earlyStopLimit
+	})
+	return visits, sum
+}
+
+func earlyStopWK8(m *wk8.OrderedMap[int, int]) (visits, sum int) {
+	for pair := m.Oldest(); pair != nil; pair = pair.Next() {
+		visits++
+		sum += pair.Key + pair.Value
+		if visits == earlyStopLimit {
+			break
+		}
+	}
+	return visits, sum
+}
+
+func earlyStopElliott(m *elliott.OrderedMap[int, int]) (visits, sum int) {
+	m.AllFromFront()(func(key, value int) bool {
+		visits++
+		sum += key + value
+		return visits != earlyStopLimit
+	})
+	return visits, sum
+}
+
+func earlyStopLorenzo(m *lorenzo.OrderedMap[int, int]) (visits, sum int) {
+	m.Range(func(key, value int) bool {
+		visits++
+		sum += key + value
+		return visits != earlyStopLimit
+	})
+	return visits, sum
 }
 
 func newHypermapWorkloadMap[K comparable](keys []K, values []int) *hypermap.Map[K, int] {

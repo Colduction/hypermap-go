@@ -1,297 +1,287 @@
 package hypermap
 
 import (
+	"encoding/binary"
 	"hash/maphash"
+	"math"
 	"math/bits"
+	"math/rand/v2"
 )
 
 const (
-	indexGroupSlots   = 8
-	indexMaxGroupLoad = 7
-	indexControlLSB   = uint64(0x0101010101010101)
-	indexControlMSB   = uint64(0x8080808080808080)
-	indexEmptyControl = uint64(0x80)
-	indexDeleted      = uint64(0xfe)
-	indexEmptyGroup   = indexControlLSB * indexEmptyControl
-	indexControlMask  = uint64(0xff)
-	indexMaxGroups    = uint64(1) << 29
-	indexMaxCapacity  = indexMaxGroups * indexMaxGroupLoad
+	indexGroupSlots    = 7
+	indexMaxGroupLoad  = 6
+	indexControlLSB    = uint64(0x0001010101010101)
+	indexControlMSB    = uint64(0x0080808080808080)
+	indexFullControl   = 0x80
+	indexOverflowByte  = 7
+	indexOverflowShift = indexOverflowByte * 8
+	indexOverflowMax   = 0xff
+	indexMaxGroups     = uint64(1) << 29
+	indexMaxCapacity   = indexMaxGroups * indexMaxGroupLoad
+	indexFreeRef       = ^uint32(0)
+	mixPrime           = 0x1d8e4e27c47d124f
 )
 
-// indexGroup keeps control bytes beside compact arena references. A control
-// byte below 0x80 is the key's seven-bit hash tag; 0x80 is empty and 0xfe is a
-// tombstone.
+var hashKey = [...]uint64{rand.Uint64(), rand.Uint64(), rand.Uint64()}
+
 type indexGroup struct {
-	control uint64
+	control [8]byte
 	refs    [indexGroupSlots]uint32
 }
 
-// hashIndex maps keys to stable, non-zero arena references. Group count is a
-// power of two and filled, which includes tombstones, never exceeds seven
-// eighths of available slots.
 type hashIndex[T comparable, T2 any] struct {
-	seed   maphash.Seed
-	groups []indexGroup
-	used   uint32
-	filled uint32
+	groups  []indexGroup
+	seed    maphash.Seed
+	mixSeed uint64
+	used    uint32
+	maxUsed uint32
 }
 
 func makeHashIndex[T comparable, T2 any](capacity int) hashIndex[T, T2] {
 	count := indexGroupsForCapacity(capacity)
-	groups := make([]indexGroup, count)
-	for i := range groups {
-		groups[i].control = indexEmptyGroup
+	return hashIndex[T, T2]{
+		groups:  make([]indexGroup, count),
+		seed:    maphash.MakeSeed(),
+		mixSeed: rand.Uint64(),
+		maxUsed: uint32(count * indexMaxGroupLoad),
 	}
-	return hashIndex[T, T2]{seed: maphash.MakeSeed(), groups: groups}
 }
 
-// get returns key's arena reference, or zero when key is absent.
-func (index *hashIndex[T, T2]) get(entries []entries[T, T2], key T) uint32 {
-	if len(index.groups) == 0 {
-		return 0
+func (index *hashIndex[T, T2]) hash(key T) uint64 {
+	var x uint64
+	switch k := any(key).(type) {
+	case int:
+		x = uint64(k)
+	case int64:
+		x = uint64(k)
+	case int32:
+		x = uint64(k)
+	case int16:
+		x = uint64(k)
+	case int8:
+		x = uint64(k)
+	case uint:
+		x = uint64(k)
+	case uint64:
+		x = k
+	case uint32:
+		x = uint64(k)
+	case uint16:
+		x = uint64(k)
+	case uint8:
+		x = uint64(k)
+	case uintptr:
+		x = uint64(k)
+	case float64:
+		if k == 0 {
+			k = 0
+		}
+		x = math.Float64bits(k)
+	case float32:
+		if k == 0 {
+			k = 0
+		}
+		x = uint64(math.Float32bits(k))
+	case string:
+		return hashString(k, index.mixSeed)
+	default:
+		return maphash.Comparable(index.seed, key)
 	}
-	hash := maphash.Comparable(index.seed, key)
-	mask := len(index.groups) - 1
-	groupIndex := int(hash>>7) & mask
-	tag := hash & 0x7f
-	var step int
-	for {
-		group := &index.groups[groupIndex]
-		matches := indexMatchTag(group.control, tag)
-		for matches != 0 {
-			slot := indexFirstMatch(matches)
-			ref := group.refs[slot]
-			if entries[ref].key == key {
-				return ref
+	return hashInt(x, index.mixSeed)
+}
+
+func hashInt(x, seed uint64) uint64 {
+	return mix(mixPrime^8, mix(x^hashKey[0], x^seed))
+}
+
+func hashString(s string, seed uint64) uint64 {
+	var a, b uint64
+	if n := len(s); n <= 16 {
+		switch {
+		case n >= 8:
+			a = load64(s, 0)
+			b = load64(s, n-8)
+		case n >= 4:
+			a = load32(s, 0)
+			b = load32(s, n-4)
+		case n > 0:
+			a = uint64(s[0]) | uint64(s[n>>1])<<8 | uint64(s[n-1])<<16
+		default:
+			return seed
+		}
+	} else {
+		p := s
+		if len(p) > 48 {
+			seed1, seed2 := seed, seed
+			for ; len(p) > 48; p = p[48:] {
+				seed = mix(load64(p, 0)^hashKey[0], load64(p, 8)^seed)
+				seed1 = mix(load64(p, 16)^hashKey[1], load64(p, 24)^seed1)
+				seed2 = mix(load64(p, 32)^hashKey[2], load64(p, 40)^seed2)
 			}
-			matches &= matches - 1
+			seed ^= seed1 ^ seed2
 		}
-		if indexMatchEmpty(group.control) != 0 {
-			return 0
+		for ; len(p) > 16; p = p[16:] {
+			seed = mix(load64(p, 0)^hashKey[0], load64(p, 8)^seed)
 		}
-		step++
-		groupIndex = (groupIndex + step) & mask
+		a = load64(s, n-16)
+		b = load64(s, n-8)
 	}
+	return mix(mixPrime^uint64(len(s)), mix(a^hashKey[0], b^seed))
 }
 
-// entry returns key's arena entry, or nil when key is absent.
-func (index *hashIndex[T, T2]) entry(entries []entries[T, T2], key T) *entries[T, T2] {
+func load64(s string, i int) uint64 {
+	b := s[i : i+8]
+	return uint64(b[0]) | uint64(b[1])<<8 | uint64(b[2])<<16 | uint64(b[3])<<24 |
+		uint64(b[4])<<32 | uint64(b[5])<<40 | uint64(b[6])<<48 | uint64(b[7])<<56
+}
+
+func load32(s string, i int) uint64 {
+	b := s[i : i+4]
+	return uint64(b[0]) | uint64(b[1])<<8 | uint64(b[2])<<16 | uint64(b[3])<<24
+}
+
+func mix(a, b uint64) uint64 {
+	hi, lo := bits.Mul64(a, b)
+	return hi ^ lo
+}
+
+func (m *Map[T, T2]) find(key T) *entries[T, T2] {
+	index := &m.index
 	if len(index.groups) == 0 {
 		return nil
 	}
-	hash := maphash.Comparable(index.seed, key)
-	mask := len(index.groups) - 1
+	var hash uint64
+	switch k := any(key).(type) {
+	case int:
+		hash = hashInt(uint64(k), index.mixSeed)
+	case string:
+		hash = hashString(k, index.mixSeed)
+	default:
+		hash = index.hash(key)
+	}
+	groups := index.groups
+	mask := len(groups) - 1
 	groupIndex := int(hash>>7) & mask
-	tag := hash & 0x7f
-	var step int
-	for {
-		group := &index.groups[groupIndex]
-		matches := indexMatchTag(group.control, tag)
-		for matches != 0 {
-			slot := indexFirstMatch(matches)
-			entry := &entries[group.refs[slot]]
-			if entry.key == key {
+	tag := hash&0x7f | indexFullControl
+	for step := 1; ; step++ {
+		group := &groups[groupIndex]
+		control := binary.LittleEndian.Uint64(group.control[:])
+		for matches := indexMatchTag(control, tag); matches != 0; matches &= matches - 1 {
+			if entry := &m.entries[group.refs[indexFirstMatch(matches)]]; entry.key == key {
 				return entry
 			}
-			matches &= matches - 1
 		}
-		if indexMatchEmpty(group.control) != 0 {
+		if control>>indexOverflowShift == 0 || step == len(groups) {
 			return nil
 		}
-		step++
 		groupIndex = (groupIndex + step) & mask
 	}
 }
 
-// lookup returns key's arena reference and exact table slot.
-func (index *hashIndex[T, T2]) lookup(entries []entries[T, T2], key T) (uint32, uint32, bool) {
-	if len(index.groups) == 0 {
-		return 0, 0, false
-	}
-	hash := maphash.Comparable(index.seed, key)
-	mask := len(index.groups) - 1
+func (index *hashIndex[T, T2]) insert(hash uint64, ref uint32) {
+	groups := index.groups
+	mask := len(groups) - 1
 	groupIndex := int(hash>>7) & mask
-	tag := hash & 0x7f
-	var step int
-	for {
-		group := &index.groups[groupIndex]
-		matches := indexMatchTag(group.control, tag)
-		for matches != 0 {
-			slot := indexFirstMatch(matches)
-			ref := group.refs[slot]
-			if entries[ref].key == key {
-				return ref, indexMakeSlot(groupIndex, slot), true
-			}
-			matches &= matches - 1
+	for step := 1; ; step++ {
+		group := &groups[groupIndex]
+		control := binary.LittleEndian.Uint64(group.control[:])
+		if empty := indexMatchEmpty(control); empty != 0 {
+			slot := indexFirstMatch(empty)
+			control |= (hash&0x7f | indexFullControl) << (slot * 8)
+			binary.LittleEndian.PutUint64(group.control[:], control)
+			group.refs[slot] = ref
+			index.used++
+			return
 		}
-		if indexMatchEmpty(group.control) != 0 {
-			return 0, 0, false
+		if control>>indexOverflowShift != indexOverflowMax {
+			binary.LittleEndian.PutUint64(group.control[:], control+1<<indexOverflowShift)
 		}
-		step++
 		groupIndex = (groupIndex + step) & mask
 	}
 }
 
-// findInsert returns an existing reference or the first reusable slot in key's
-// probe sequence. index must contain at least one group.
-func (index *hashIndex[T, T2]) findInsert(entries []entries[T, T2], key T) (uint32, uint32, uint8) {
-	hash := maphash.Comparable(index.seed, key)
-	mask := len(index.groups) - 1
-	groupIndex := int(hash>>7) & mask
-	tag := hash & 0x7f
-	var (
-		step        int
-		deletedSlot uint32
-		hasDeleted  bool
-	)
-	for {
-		group := &index.groups[groupIndex]
-		matches := indexMatchTag(group.control, tag)
-		for matches != 0 {
-			slot := indexFirstMatch(matches)
-			ref := group.refs[slot]
-			if entries[ref].key == key {
-				return ref, indexMakeSlot(groupIndex, slot), uint8(tag)
-			}
-			matches &= matches - 1
-		}
-		empty := indexMatchEmpty(group.control)
-		deleted := indexMatchAvailable(group.control) &^ empty
-		if !hasDeleted && deleted != 0 {
-			deletedSlot = indexMakeSlot(groupIndex, indexFirstMatch(deleted))
-			hasDeleted = true
-		}
-		if empty != 0 {
-			if hasDeleted {
-				return 0, deletedSlot, uint8(tag)
-			}
-			return 0, indexMakeSlot(groupIndex, indexFirstMatch(empty)), uint8(tag)
-		}
-		step++
-		groupIndex = (groupIndex + step) & mask
-	}
-}
-
-func (index *hashIndex[T, T2]) insert(slot uint32, tag uint8, ref uint32) {
-	groupIndex, groupSlot := indexSplitSlot(slot)
-	group := &index.groups[groupIndex]
-	if indexControlAt(group.control, groupSlot) == indexEmptyControl {
-		index.filled++
-	}
-	indexSetControl(&group.control, groupSlot, uint64(tag))
-	group.refs[groupSlot] = ref
-	index.used++
-}
-
-func (index *hashIndex[T, T2]) deleteSlot(slot uint32) {
-	groupIndex, groupSlot := indexSplitSlot(slot)
-	group := &index.groups[groupIndex]
-	group.refs[groupSlot] = 0
+func (index *hashIndex[T, T2]) remove(hash uint64, step int, group *indexGroup, slot int) {
+	control := binary.LittleEndian.Uint64(group.control[:])
+	binary.LittleEndian.PutUint64(group.control[:], control&^(0xff<<(slot*8)))
 	index.used--
-	if indexMatchEmpty(group.control) != 0 {
-		indexSetControl(&group.control, groupSlot, indexEmptyControl)
-		index.filled--
-		return
+	groups := index.groups
+	mask := len(groups) - 1
+	groupIndex := int(hash>>7) & mask
+	for i := 1; i < step; i++ {
+		passed := &groups[groupIndex]
+		if control := binary.LittleEndian.Uint64(passed.control[:]); control>>indexOverflowShift != indexOverflowMax {
+			binary.LittleEndian.PutUint64(passed.control[:], control-1<<indexOverflowShift)
+		}
+		groupIndex = (groupIndex + i) & mask
 	}
-	indexSetControl(&group.control, groupSlot, indexDeleted)
 }
 
-// deleteRef removes the exact arena reference. Reflexive keys use their normal
-// probe; non-reflexive keys such as NaN require a reference scan because they
-// cannot be found again by equality.
-func (index *hashIndex[T, T2]) deleteRef(entries []entries[T, T2], key T, ref uint32) {
-	if found, slot, ok := index.lookup(entries, key); ok && found == ref {
-		index.deleteSlot(slot)
-		return
+func (index *hashIndex[T, T2]) removeRef(key T, ref uint32) {
+	var hash uint64
+	switch k := any(key).(type) {
+	case int:
+		hash = hashInt(uint64(k), index.mixSeed)
+	case string:
+		hash = hashString(k, index.mixSeed)
+	default:
+		hash = index.hash(key)
 	}
-	if key == key {
-		panic("hypermap: index invariant violated")
-	}
-	for groupIndex := range index.groups {
-		group := &index.groups[groupIndex]
-		occupied := ^group.control & indexControlMSB
-		for occupied != 0 {
-			slot := indexFirstMatch(occupied)
-			if group.refs[slot] == ref {
-				index.deleteSlot(indexMakeSlot(groupIndex, slot))
+	groups := index.groups
+	mask := len(groups) - 1
+	groupIndex := int(hash>>7) & mask
+	tag := hash&0x7f | indexFullControl
+	for step := 1; step <= len(groups); step++ {
+		group := &groups[groupIndex]
+		for matches := indexMatchTag(binary.LittleEndian.Uint64(group.control[:]), tag); matches != 0; matches &= matches - 1 {
+			if slot := indexFirstMatch(matches); group.refs[slot] == ref {
+				index.remove(hash, step, group, slot)
 				return
 			}
-			occupied &= occupied - 1
 		}
+		groupIndex = (groupIndex + step) & mask
 	}
 	panic("hypermap: index invariant violated")
 }
 
-func (index *hashIndex[T, T2]) clear() {
-	for i := range index.groups {
-		index.groups[i] = indexGroup{control: indexEmptyGroup}
-	}
-	index.used = 0
-	index.filled = 0
-}
-
-func (index *hashIndex[T, T2]) maxLoad() uint64 {
-	return uint64(len(index.groups)) * indexMaxGroupLoad
-}
-
-// growForInsert reports whether an exhausted fill budget should grow instead
-// of compacting tombstones. Requiring tombstones in at least one tenth of all
-// slots amortizes each same-size rebuild across a proportional number of
-// deletions.
-func (index *hashIndex[T, T2]) growForInsert() bool {
-	maxLoad := index.maxLoad()
-	if uint64(index.used) >= maxLoad {
-		return true
-	}
-	if uint64(len(index.groups)) >= indexMaxGroups {
-		return false
-	}
-	tombstones := uint64(index.filled) - uint64(index.used)
-	physicalSlots := uint64(len(index.groups)) * indexGroupSlots
-	return tombstones*10 < physicalSlots
-}
-
-// rebuild removes tombstones at the current size or doubles group storage when
-// grow is true.
-func (index *hashIndex[T, T2]) rebuild(entries []entries[T, T2], grow bool) {
-	count := len(index.groups)
-	if grow {
-		if uint64(count)*2 > indexMaxGroups {
-			panic("hypermap: ordered map capacity too large")
+func (index *hashIndex[T, T2]) clear(entries []entries[T, T2], unindexed bool) {
+	if uint64(index.used)*8 < uint64(len(index.groups)) {
+		for ref := 1; ref < len(entries) && index.used != 0; ref++ {
+			entry := &entries[ref]
+			if entry.prev == indexFreeRef || (unindexed && entry.key != entry.key) {
+				continue
+			}
+			index.removeRef(entry.key, uint32(ref))
 		}
-		count *= 2
-		index.groups = make([]indexGroup, count)
 	} else {
 		clear(index.groups)
-	}
-	for i := range index.groups {
-		index.groups[i].control = indexEmptyGroup
-	}
-	index.used = 0
-	index.filled = 0
-	for ref := entries[0].next; ref != 0; ref = entries[ref].next {
-		index.insertRehashed(entries[ref].key, ref)
+		index.used = 0
 	}
 }
 
-func (index *hashIndex[T, T2]) insertRehashed(key T, ref uint32) {
-	hash := maphash.Comparable(index.seed, key)
-	mask := len(index.groups) - 1
-	groupIndex := int(hash>>7) & mask
-	tag := hash & 0x7f
-	var step int
-	for {
-		group := &index.groups[groupIndex]
-		if empty := indexMatchEmpty(group.control); empty != 0 {
-			slot := indexFirstMatch(empty)
-			indexSetControl(&group.control, slot, tag)
-			group.refs[slot] = ref
-			index.used++
-			index.filled++
-			return
+func (index *hashIndex[T, T2]) grow(entries []entries[T, T2], unindexed bool) {
+	count := uint64(len(index.groups)) * 2
+	if count > indexMaxGroups {
+		panic("hypermap: ordered map capacity too large")
+	}
+	index.groups = make([]indexGroup, count)
+	index.maxUsed = uint32(count * indexMaxGroupLoad)
+	index.used = 0
+	for ref := 1; ref < len(entries); ref++ {
+		entry := &entries[ref]
+		if entry.prev == indexFreeRef || (unindexed && entry.key != entry.key) {
+			continue
 		}
-		step++
-		groupIndex = (groupIndex + step) & mask
+		var hash uint64
+		switch k := any(entry.key).(type) {
+		case int:
+			hash = hashInt(uint64(k), index.mixSeed)
+		case string:
+			hash = hashString(k, index.mixSeed)
+		default:
+			hash = index.hash(entry.key)
+		}
+		index.insert(hash, uint32(ref))
 	}
 }
 
@@ -314,30 +304,10 @@ func indexMatchTag(control, tag uint64) uint64 {
 }
 
 func indexMatchEmpty(control uint64) uint64 {
-	return control &^ (control << 6) & indexControlMSB
-}
-
-func indexMatchAvailable(control uint64) uint64 {
-	return control & indexControlMSB
+	vacant := ^control
+	return vacant & (vacant << 7) & indexControlMSB
 }
 
 func indexFirstMatch(matches uint64) int {
 	return bits.TrailingZeros64(matches) >> 3
-}
-
-func indexSetControl(control *uint64, slot int, tag uint64) {
-	shift := uint(slot * 8)
-	*control = *control&^(indexControlMask<<shift) | tag<<shift
-}
-
-func indexControlAt(control uint64, slot int) uint64 {
-	return control >> uint(slot*8) & indexControlMask
-}
-
-func indexMakeSlot(group, slot int) uint32 {
-	return uint32(group)<<3 | uint32(slot)
-}
-
-func indexSplitSlot(slot uint32) (int, int) {
-	return int(slot >> 3), int(slot & (indexGroupSlots - 1))
 }

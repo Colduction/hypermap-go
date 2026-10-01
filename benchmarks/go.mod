@@ -1,10 +1,10 @@
 module github.com/colduction/hypermap-go/benchmarks
 
-go 1.26.4
+go 1.27.1
 
 require (
-	github.com/colduction/hypermap-go v0.0.0
-	github.com/elliotchance/orderedmap/v3 v3.1.0
+	github.com/colduction/hypermap-go v1.1.0
+	github.com/elliotchance/orderedmap/v3 v3.1.1
 	github.com/lorenzosaino/go-orderedmap v0.0.0-20230408205020-cf642d91fab6
 	github.com/wk8/go-ordered-map/v2 v2.1.8
 )

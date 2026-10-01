@@ -56,7 +56,9 @@ func BenchmarkMoveToFrontBack(b *testing.B) {
 }
 
 // BenchmarkRange measures each package's fastest non-allocating complete
-// insertion-order traversal API.
+// insertion-order traversal API. Each traversal runs in a helper function,
+// because the compiler does not inline calls made directly in a b.Loop body;
+// the helpers compile callbacks as ordinary code does.
 func BenchmarkRange(b *testing.B) {
 	b.Run("hypermap", benchmarkHypermapRange)
 	b.Run("wk8", benchmarkWK8Range)
@@ -302,13 +304,9 @@ func benchmarkLorenzoMoveToFrontBack(b *testing.B) {
 func benchmarkHypermapRange(b *testing.B) {
 	m := newHypermap()
 	var sum int
-	yield := func(key, value int) bool {
-		sum += key + value
-		return true
-	}
 	b.ReportAllocs()
 	for b.Loop() {
-		m.RangeFunc(yield)
+		sum += sumHypermap(&m)
 	}
 	benchmarkValue = sum
 }
@@ -318,9 +316,7 @@ func benchmarkWK8Range(b *testing.B) {
 	var sum int
 	b.ReportAllocs()
 	for b.Loop() {
-		for pair := m.Oldest(); pair != nil; pair = pair.Next() {
-			sum += pair.Key + pair.Value
-		}
+		sum += sumWK8(m)
 	}
 	benchmarkValue = sum
 }
@@ -328,13 +324,9 @@ func benchmarkWK8Range(b *testing.B) {
 func benchmarkElliottRange(b *testing.B) {
 	m := newElliottMap()
 	var sum int
-	yield := func(key, value int) bool {
-		sum += key + value
-		return true
-	}
 	b.ReportAllocs()
 	for b.Loop() {
-		m.AllFromFront()(yield)
+		sum += sumElliott(m)
 	}
 	benchmarkValue = sum
 }
@@ -342,15 +334,42 @@ func benchmarkElliottRange(b *testing.B) {
 func benchmarkLorenzoRange(b *testing.B) {
 	m := newLorenzoMap()
 	var sum int
-	yield := func(key, value int) bool {
-		sum += key + value
-		return true
-	}
 	b.ReportAllocs()
 	for b.Loop() {
-		m.Range(yield)
+		sum += sumLorenzo(m)
 	}
 	benchmarkValue = sum
+}
+
+func sumHypermap(m *hypermap.Map[int, int]) (sum int) {
+	m.RangeFunc(func(key, value int) bool {
+		sum += key + value
+		return true
+	})
+	return sum
+}
+
+func sumWK8(m *wk8.OrderedMap[int, int]) (sum int) {
+	for pair := m.Oldest(); pair != nil; pair = pair.Next() {
+		sum += pair.Key + pair.Value
+	}
+	return sum
+}
+
+func sumElliott(m *elliott.OrderedMap[int, int]) (sum int) {
+	m.AllFromFront()(func(key, value int) bool {
+		sum += key + value
+		return true
+	})
+	return sum
+}
+
+func sumLorenzo(m *lorenzo.OrderedMap[int, int]) (sum int) {
+	m.Range(func(key, value int) bool {
+		sum += key + value
+		return true
+	})
+	return sum
 }
 
 func benchmarkHypermapFill(b *testing.B) {

@@ -585,7 +585,7 @@ func TestMapGrowthReindexesNonReflexiveKeys(t *testing.T) {
 	}
 }
 
-func TestMapSwissSteadyChurnDoesNotAllocate(t *testing.T) {
+func TestMapSteadyChurnDoesNotAllocate(t *testing.T) {
 	const size = 112
 	m := New[int, int](size)
 	keys := make([]int, size)
@@ -608,13 +608,12 @@ func TestMapSwissSteadyChurnDoesNotAllocate(t *testing.T) {
 		}
 	}
 	initialGroups := len(m.index.groups)
-	churnBatch() // Allow the index to add tombstone headroom when needed.
-	if len(m.index.groups) <= initialGroups {
-		t.Fatalf("churn left %d index groups, want more than initial %d", len(m.index.groups), initialGroups)
-	}
-	allocations := testing.AllocsPerRun(1, churnBatch)
+	allocations := testing.AllocsPerRun(5, churnBatch)
 	if allocations != 0 {
 		t.Fatalf("10,000-operation steady churn batch allocated %.0f times, want 0", allocations)
+	}
+	if len(m.index.groups) != initialGroups {
+		t.Fatalf("churn resized the index from %d to %d groups", initialGroups, len(m.index.groups))
 	}
 	if m.Len() != size {
 		t.Fatalf("Len after churn = %d, want %d", m.Len(), size)
